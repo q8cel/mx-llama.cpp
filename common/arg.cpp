@@ -4136,6 +4136,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--spec-draft-batch-size", "-nbd", "--batch-size-draft"}, "N",
+        "logical batch size for the draft context; must stay >= the target's --batch-size, since draft-mtp re-prefills whole target batches\n"
+        "(default: same as --batch-size)",
+        [](common_params & params, int value) {
+            params.speculative.draft.n_batch = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_BATCH_SIZE"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "-ubd", "--ubatch-size-draft"}, "N",
+        "physical batch size for the draft context; the draft compute buffer scales with it, so a small value saves VRAM\n"
+        "(default: same as --ubatch-size)",
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE"));
+    add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
             parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
@@ -4223,6 +4239,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-adaptive"}, "<0|1>",
+        string_format("draft only while it measurably helps: measure delivered tokens/sec with drafting on and off, keep the faster mode (default: %d)", params.speculative.adaptive ? 1 : 0),
+        [](common_params & params, int value) {
+            params.speculative.adaptive = value != 0;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-adaptive-window"}, "N",
+        string_format("delivered tokens per adaptive measurement window (default: %d)", params.speculative.adaptive_window),
+        [](common_params & params, int value) {
+            params.speculative.adaptive_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-adaptive-explore"}, "N",
+        string_format("probe the other mode at least this often, in delivered tokens (default: %d)", params.speculative.adaptive_explore),
+        [](common_params & params, int value) {
+            params.speculative.adaptive_explore = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_EXPLORE"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

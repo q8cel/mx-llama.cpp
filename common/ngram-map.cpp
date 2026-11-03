@@ -277,6 +277,10 @@ void common_ngram_map_draft(common_ngram_map & map,
     }
     if (match_pos == 0 && map.size_last_begin > (size_t) (n + m + 1)) {
         // Search for the key in [1, map.size_last_begin - n - m -1], descending.
+        // note: no key_map_last_idx bound here - that is a hash-fill watermark and
+        // tracking cur_len, so using it as a search bound excludes the whole prompt
+        // from matching as soon as generation starts (the n-gram map then only sees
+        // the generated region and drafts stall for hundreds of tokens)
         for (size_t j = map.size_last_begin - n - m - 1; j > map.key_map_last_idx; --j) {
             // Check if the key matches the key.
             bool match = true;
@@ -368,6 +372,7 @@ void common_ngram_map_draft(common_ngram_map & map,
         for (int i = 0; i < COMMON_NGRAM_MAX_VALUES; ++i) {
             new_key.values[i].value_num = 0;
             new_key.values[i].n_accepted = m;
+            new_key.values[i].next_len  = m;
         }
         map.keys.push_back(new_key);
     }
@@ -383,7 +388,8 @@ void common_ngram_map_draft(common_ngram_map & map,
         // simple mode:
         // Fill in the draft with the m tokens following the key.
         // We work with value values[0] only.
-        int n_draft_tokens = std::min((int) m, (int) curr_key.values[0].n_accepted);
+        int n_draft_tokens = std::min((int) m, (int) std::max<uint16_t>(curr_key.values[0].next_len, 1));
+        map.last_draft_len = n_draft_tokens;
 
         for (int i = 0; i < n_draft_tokens; ++i) {
             draft.push_back(inp[match_pos + n + i]);
@@ -432,6 +438,7 @@ void common_ngram_map_draft(common_ngram_map & map,
                 curr_key.values[v].value_idx = idx_begin_value_key;
                 curr_key.values[v].value_num = 0;
                 curr_key.values[v].n_accepted = m;
+                curr_key.values[v].next_len  = m;
                 idx_value = v;
                 break;
             }
@@ -500,7 +507,8 @@ void common_ngram_map_draft(common_ngram_map & map,
 
     // We use the most frequent value values[slot_max] for the draft.
     // Fill in the draft with the m tokens following the key.
-    int n_draft_tokens = std::min((int) m, (int) curr_key.values[slot_max].n_accepted);
+    int n_draft_tokens = std::min((int) m, (int) std::max<uint16_t>(curr_key.values[slot_max].next_len, 1));
+    map.last_draft_len = n_draft_tokens;
 
     for (int i = 0; i < n_draft_tokens; ++i) {
         draft.push_back(inp[match_pos + n + i]);
@@ -533,4 +541,16 @@ void common_ngram_map_accept(common_ngram_map & map, uint16_t n_accepted) {
     LOG_DBG("common_ngram_map_send_accepted: n_accepted = %d, prev value_num = %d\n",
             n_accepted, curr_value.n_accepted);
     curr_value.n_accepted = n_accepted;
+
+    // Grow the proposal back on full acceptance (slow start), shrink it to what
+    // was actually accepted otherwise. It must never reach 0: a draft of length
+    // 0 means accept() is not called again for this value, so the value could
+    // never recover and its key would stay disabled for the rest of the task.
+    const uint16_t m = map.size_value;
+    if (map.last_draft_len > 0 && n_accepted >= map.last_draft_len) {
+        const uint32_t grown = std::max<uint32_t>(curr_value.next_len + 1, 2u * curr_value.next_len);
+        curr_value.next_len = (uint16_t) std::min<uint32_t>(m, grown);
+    } else {
+        curr_value.next_len = std::max<uint16_t>(1, n_accepted);
+    }
 }

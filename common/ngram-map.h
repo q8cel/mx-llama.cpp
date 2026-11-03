@@ -46,6 +46,7 @@ struct common_ngram_map_value {
     size_t   value_idx =  0;  // index of value m-gram in token-history (0 if unused)
     uint16_t value_num =  0;  // number of occurrences of this value m-gram after the key n-gram (0 in an unused values-slot)
     int16_t n_accepted = -1;  // number of accepted tokens at last draft (-1 if unused)
+    uint16_t next_len  =  0;  // tokens to propose at the next draft: regrows on full acceptance, never drops to 0
 };
 
 // statistics of a n-gram
@@ -84,6 +85,7 @@ struct common_ngram_map {
     bool     last_draft_created   = false; // true if a draft was created at last call.
     size_t   last_draft_key_idx   = 0; // index of last key used for draft generation (0 = no draft)
     uint16_t last_draft_value_idx = 0; // index of last value used for draft generation.
+    uint16_t last_draft_len       = 0; // number of tokens proposed at last draft
 
     size_t   idx_last_check       = 0; // index of last check in context history
 

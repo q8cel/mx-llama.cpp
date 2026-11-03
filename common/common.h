@@ -338,8 +338,14 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    // note: a quantized draft cache can cost more compute-buffer staging than f16 (the MTP graph dequantizes K/V), so measure before overriding
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    // 0 = inherit the target's batch sizes. A draft context runs short decode batches
+    // and chunked re-prefill only, so it rarely needs the target's n_ubatch.
+    int32_t n_batch  = 0;
+    int32_t n_ubatch = 0;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -375,6 +381,14 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    // adaptive on/off: draft only while it measurably helps. The server measures
+    // delivered tokens/sec in windows with drafting on and off and keeps the
+    // faster mode; the other mode is probed periodically so the decision tracks
+    // changing workloads (e.g. acceptance collapsing as context grows).
+    bool    adaptive         = true;
+    int32_t adaptive_window  = 256;  // delivered tokens per measurement window
+    int32_t adaptive_explore = 4096; // probe the other mode at least this often
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;

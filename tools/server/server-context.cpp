@@ -367,6 +367,23 @@ struct server_slot {
 
     server_slot_stats stats;
 
+    // adaptive speculative decoding state (see spec_adaptive_tick): rolling
+    // delivered-token throughput of the drafting on/off modes. Kept across
+    // tasks; the window re-anchors on reset because n_gen restarts.
+    struct spec_adaptive_state {
+        bool     enabled = true;     // drafting allowed for the current window
+        bool     win_on  = true;     // mode the current window measures
+        uint64_t win_n0  = 0;        // stats.n_gen at window start
+        int64_t  win_t0  = 0;        // wall clock at window start
+        uint64_t win_drafted0 = 0;   // stats.n_draft_tokens at window start
+        uint64_t win_accept0  = 0;   // stats.n_draft_accepted at window start
+        double   tps_on  = -1.0;     // last measured delivered tokens/sec
+        double   tps_off = -1.0;
+        uint64_t n_seen  = 0;        // delivered tokens, cumulative across tasks
+        uint64_t n_last  = 0;        // stats.n_gen at the previous tick
+        uint64_t n_probe = 0;        // n_seen at the last probe or switch
+    } spec_ad;
+
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
@@ -406,6 +423,9 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_ad.win_t0 = 0;
+        spec_ad.win_n0 = 0;
+        spec_ad.n_last = 0;
 
         n_predict_max = -1;
 
@@ -844,6 +864,101 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 //
 // server_context_impl (private implementation)
 //
+
+// Adaptive speculative decoding: measure delivered tokens/sec in windows with
+// drafting on and off, keep the faster mode. The other mode is probed at least
+// every cfg.adaptive_explore tokens so the decision follows the workload (draft
+// acceptance changes as the context grows). Tunes: LLAMA_SPEC_ADAPTIVE_MARGIN
+// (rate advantage needed to switch, default 0.05), LLAMA_SPEC_ADAPTIVE_ACC
+// (acceptance floor: drafting is dropped regardless of rates, default 0.30).
+static bool spec_adaptive_tick(server_slot & slot, const common_params_speculative & cfg) {
+    auto & st = slot.spec_ad;
+
+    if (!cfg.adaptive) {
+        return true;
+    }
+
+    static const double margin = []() {
+        const char * e = getenv("LLAMA_SPEC_ADAPTIVE_MARGIN");
+        return e && e[0] ? atof(e) : 0.05;
+    }();
+    static const double acc_floor = []() {
+        const char * e = getenv("LLAMA_SPEC_ADAPTIVE_ACC");
+        return e && e[0] ? atof(e) : 0.30;
+    }();
+
+    const int64_t  t_now = ggml_time_us();
+    const uint64_t n     = slot.stats.n_gen;
+
+    st.n_seen += n - st.n_last;
+    st.n_last  = n;
+
+    if (st.win_t0 == 0) {
+        st.win_t0 = t_now;
+        st.win_n0 = n;
+        st.win_on = st.enabled;
+        st.win_drafted0 = slot.stats.n_draft_tokens;
+        st.win_accept0  = slot.stats.n_draft_accepted;
+        return st.enabled;
+    }
+
+    const uint64_t win_min = (uint64_t) std::max(32, cfg.adaptive_window);
+    if (n - st.win_n0 < win_min) {
+        return st.enabled;
+    }
+
+    // close the window and record its rate
+    const double   win_s   = std::max((t_now - st.win_t0) / 1e6, 1e-3);
+    const double   tps     = (double) (n - st.win_n0) / win_s;
+    const uint64_t drafted = slot.stats.n_draft_tokens   - st.win_drafted0;
+    const uint64_t accept  = slot.stats.n_draft_accepted - st.win_accept0;
+    const double   acc     = drafted > 0 ? (double) accept / (double) drafted : 0.0;
+
+    if (st.win_on) {
+        st.tps_on = tps;
+        SLT_INF(slot, "spec-adaptive: window with drafting %llu tok @ %.2f t/s, acceptance %.2f (%llu/%llu)\n",
+                (unsigned long long) (n - st.win_n0), tps, acc,
+                (unsigned long long) accept, (unsigned long long) drafted);
+    } else {
+        st.tps_off = tps;
+        SLT_INF(slot, "spec-adaptive: window without drafting %llu tok @ %.2f t/s\n",
+                (unsigned long long) (n - st.win_n0), tps);
+    }
+
+    // pick the mode for the next window
+    bool next = st.win_on;
+    if (st.win_on && drafted >= win_min / 8 && acc < acc_floor) {
+        next = false; // acceptance is hopeless: drafting is pure overhead
+    } else if (st.tps_on > 0.0 && st.tps_off > 0.0) {
+        if (st.tps_off > st.tps_on * (1.0 + margin)) {
+            next = false;
+        } else if (st.tps_on > st.tps_off * (1.0 + margin)) {
+            next = true;
+        }
+    }
+
+    // exploration: probe the other mode when its estimate is missing or stale
+    const bool other_unknown = st.win_on ? st.tps_off <= 0.0 : st.tps_on <= 0.0;
+    const bool stale = st.n_seen - st.n_probe >= std::max(win_min, (uint64_t) cfg.adaptive_explore);
+    if (other_unknown || stale) {
+        next = !st.win_on;
+        st.n_probe = st.n_seen;
+    }
+
+    if (next != st.enabled) {
+        SLT_INF(slot, "spec-adaptive: drafting %s (on %.2f t/s, off %.2f t/s, acceptance %.2f)\n",
+                next ? "enabled" : "disabled", st.tps_on, st.tps_off, acc);
+    }
+
+    st.enabled = next;
+    st.win_on  = next;
+    st.win_t0  = t_now;
+    st.win_n0  = n;
+    st.win_drafted0 = slot.stats.n_draft_tokens;
+    st.win_accept0  = slot.stats.n_draft_accepted;
+
+    return st.enabled;
+}
 
 struct server_context_impl {
     friend struct server_context;
@@ -3008,7 +3123,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = spec_adaptive_tick(slot, params_base.speculative) ? slot.get_n_draft_max() : 0;
 
                 // with the deferred sampling of chunked prefill, a slot can reach
                 // pre_decode before its first token was sampled - no anchor to
@@ -3063,6 +3178,13 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+
+            if (getenv("LLAMA_SPEC_TRACE")) {
+                static const int64_t t_trace_start = ggml_time_us();
+                SLT_INF(slot, "spec-draft: t=%7.0f ms size=%3zu n_gen=%llu n_past=%d\n",
+                        (ggml_time_us() - t_trace_start) / 1000.0, draft.size(),
+                        (unsigned long long) slot.stats.n_gen, slot.prompt.n_tokens());
+            }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -4091,6 +4213,16 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+
+            // LLAMA_SPEC_TRACE=1: one line per verify step - time since the first
+            // token of this task, draft length, accepted count. Used to find where
+            // speculative decoding warms up (or fails to) inside a task.
+            if (getenv("LLAMA_SPEC_TRACE")) {
+                static const int64_t t_trace_start = ggml_time_us();
+                SLT_INF(slot, "spec-step: t=%7.0f ms drafted=%3zu accepted=%3zu n_gen=%llu\n",
+                        (ggml_time_us() - t_trace_start) / 1000.0, n_draft, n_accepted,
+                        (unsigned long long) slot.stats.n_gen);
+            }
         });
     }
 
