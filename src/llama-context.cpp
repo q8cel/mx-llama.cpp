@@ -3069,6 +3069,32 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    if (getenv("LLAMA_DUMP_GRAPH_SIZES")) {
+        LLAMA_LOG_WARN("GRAPH_DUMP n_tokens=%u n_seqs=%u n_outputs=%u ctx_type=%d nodes=%d\n",
+                n_tokens, n_seqs, n_outputs, (int) cparams.ctx_type, ggml_graph_n_nodes(gf));
+        struct item { const char * name; size_t n; int64_t ne[4]; int type; };
+        std::vector<item> items;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            if (t->data || t->view_src) {
+                continue;
+            }
+            items.push_back({t->name, ggml_nbytes(t), {t->ne[0], t->ne[1], t->ne[2], t->ne[3]}, (int) t->type});
+        }
+        std::sort(items.begin(), items.end(), [](const item & a, const item & b) { return a.n > b.n; });
+        size_t total = 0;
+        for (const auto & it : items) { total += it.n; }
+        LLAMA_LOG_WARN("GRAPH_DUMP totals: %zu intermediate tensors, %zu B (%.2f MiB)\n",
+                items.size(), total, total / 1024.0 / 1024.0);
+        for (int i = 0; i < (int) std::min<size_t>(items.size(), 12); ++i) {
+            LLAMA_LOG_WARN("GRAPH_SIZE %10zu B  %s  [%lld, %lld, %lld, %lld] type=%s\n",
+                    items[i].n, items[i].name,
+                    (long long) items[i].ne[0], (long long) items[i].ne[1],
+                    (long long) items[i].ne[2], (long long) items[i].ne[3],
+                    ggml_type_name((ggml_type) items[i].type));
+        }
+    }
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph

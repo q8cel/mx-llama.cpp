@@ -1886,6 +1886,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const int64_t n_tps = n_tokens/n_stream;
 
     //const int64_t t_start = ggml_time_us();
+    static const bool kq_timing = getenv("LLAMA_KQ_MASK_TIMING") != nullptr;
+    const int64_t t_start = kq_timing ? ggml_time_us() : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1906,6 +1908,15 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
 
     //const int64_t t_end = ggml_time_us();
+    if (kq_timing) {
+        const int64_t t_end = ggml_time_us();
+        static int64_t total_us = 0, calls = 0, bytes = 0;
+        total_us += t_end - t_start;
+        calls   += 1;
+        bytes   += (int64_t) ggml_nbytes(dst);
+        LLAMA_LOG_WARN("kq_mask: fill %0.3f ms, tensor %zu B, running avg %0.3f ms over %lld calls, %lld MB filled\n",
+                (t_end - t_start) / 1000.0, ggml_nbytes(dst), total_us / 1000.0 / (double) calls, (long long) calls, (long long) (bytes / 1048576));
+    }
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
