@@ -990,6 +990,21 @@ void launch_fattn(
 
     ggml_tensor * KQV = dst;
 
+    if (getenv("LLAMA_FATTN_TRACE")) {
+        static int64_t n_calls = 0, n_conv = 0, bytes_conv = 0, bytes_attn = 0;
+        const int64_t kb = (int64_t) ggml_nbytes(K);
+        const int64_t vb = (int64_t) ggml_nbytes(V);
+        n_calls  += 1;
+        bytes_attn += kb + vb;
+        if (need_f16_K && K->type != GGML_TYPE_F16) { n_conv += 1; bytes_conv += kb + vb; }
+        GGML_LOG_WARN("fattn: ncols=%d D=%d n_q=%lld n_kv=%lld K=%s V=%s conv_f16=%d (%.1f MB)%s running: calls=%lld conv=%lld conv=%.0f MB attn=%.0f MB\n",
+                ncols, (int) Q->ne[0], (long long) Q->ne[1], (long long) K->ne[1],
+                ggml_type_name(K->type), ggml_type_name(V->type),
+                (need_f16_K && K->type != GGML_TYPE_F16) ? 1 : 0, kb / 1048576.0,
+                V_is_K_view ? " V=K_view" : "",
+                (long long) n_calls, (long long) n_conv, bytes_conv / 1048576.0, bytes_attn / 1048576.0);
+    }
+
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
 

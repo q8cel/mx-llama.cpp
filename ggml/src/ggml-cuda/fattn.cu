@@ -355,7 +355,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -531,6 +531,34 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+// Picks the kernel, then lets LLAMA_FATTN_FORCE=tile|vec override it for
+// benchmarking and for tuning on hardware where the automatic pick is not the
+// fastest. Only choices the shape allows are forced.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel automatic = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+
+    static const char * force = getenv("LLAMA_FATTN_FORCE");
+    if (force == nullptr) {
+        return automatic;
+    }
+
+    if (strcmp(force, "tile") == 0) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
+    if (strcmp(force, "vec") == 0) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const bool can_use_vector_kernel =
+            Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        if (can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+    }
+
+    return automatic;
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
