@@ -236,9 +236,11 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
         } break;
         case 3: {
             if (lanes32_ok) {
-                // 32 lanes to a row, 8 rows per block, one row per lane.
+                // 32 lanes to a row, 8 rows per block, 2 rows per lane: 5
+                // accumulations against a 5-step reduction at ne0=5120, and the
+                // activation block is reused by the second row.
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_repacked_nc<8, 4, 3, 1, 32, WT><<<grid, 256, 0, stream>>>(
+                mul_mat_vec_repacked_nc<8, 2, 3, 2, 32, WT><<<grid, 128, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
@@ -247,9 +249,15 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
             }
         } break;
         case 4: {
-            const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT><<<grid, 64, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            if (lanes32_ok) {
+                const dim3 grid((ne01 + 7) / 8, 1, 1);
+                mul_mat_vec_repacked_nc<8, 2, 4, 2, 32, WT><<<grid, 128, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            } else {
+                const dim3 grid((ne01 + 1) / 2, 1, 1);
+                mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT><<<grid, 64, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+            }
         } break;
         case 5: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
