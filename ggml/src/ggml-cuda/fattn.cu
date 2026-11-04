@@ -525,14 +525,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
                 }
             }
         } else {
-            // LLAMA_FATTN_VEC_MAX_NQ: run the quantized vector kernel for
-            // batches up to this many query tokens (default 2 = upstream).
-            // The vector kernel reads the quantized cache directly, while the
-            // tile kernel converts the whole KV slice to f16 on every call.
-            static const int vec_max_nq = []() {
+            // The vector kernel reads the quantized cache directly, but on gfx906 it
+            // was measured to be slower than the tile kernel - which also reads the
+            // cache directly now - even for single-token decode at long context.
+            // LLAMA_FATTN_VEC_MAX_NQ overrides the batch size up to which the vector
+            // kernel is used; -1 (default) means "only where it is the better kernel".
+            static const int vec_max_nq_env = []() {
                 const char * e = getenv("LLAMA_FATTN_VEC_MAX_NQ");
-                return e != nullptr ? std::max(0, atoi(e)) : 2;
+                return e != nullptr ? std::max(0, atoi(e)) : -1;
             }();
+            // Measured on 2x MI50, gfx906, q8_0 KV, head size 256, 131k context:
+            //   tile kernel (with the fp16 copy): 1.18 ms/layer at 1 token, 1.51 at 3
+            //   vector kernel:                    1.42 ms/layer at 1 token, 2.50 at 2
+            // The tile kernel wins even for single-token decode, so q8_0 no longer
+            // uses the vector kernel. Other quantized types keep the vector kernel.
+            const bool prefer_tile = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                ggml_cuda_fattn_tile_has_head_size(K, V);
+            const int vec_max_nq = vec_max_nq_env >= 0 ? vec_max_nq_env : (prefer_tile ? 0 : 2);
             if (Q->ne[1] <= vec_max_nq) {
                 return BEST_FATTN_KERNEL_VEC;
             }
@@ -585,6 +594,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // q8_0 K/V with a quantized tile variant is read directly.
+            need_f16_K = !ggml_cuda_fattn_tile_quantized_kv(K, V);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
