@@ -329,8 +329,8 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
             case GGML_TYPE_Q6_K: {
-                const dim3 grid((ne01 + 15) / 16, 1, 1);
-                mul_mat_vec_rp<GGML_TYPE_Q6_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                const dim3 grid((ne01 + 4 - 1) / 4, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q6_K, 4, 4, false><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
@@ -517,7 +517,7 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);
         } else if (src0->type == GGML_TYPE_Q6_K) {
-            mul_mat_vec_rp<GGML_TYPE_Q6_K, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+            mul_mat_vec_rp<GGML_TYPE_Q6_K, 4, 4, false, 64, true><<<dim3((ne01 + 3) / 4, 1, 1), 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);
