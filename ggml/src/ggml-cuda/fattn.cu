@@ -525,7 +525,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // LLAMA_FATTN_VEC_MAX_NQ: run the quantized vector kernel for
+            // batches up to this many query tokens (default 2 = upstream).
+            // The vector kernel reads the quantized cache directly, while the
+            // tile kernel converts the whole KV slice to f16 on every call.
+            static const int vec_max_nq = []() {
+                const char * e = getenv("LLAMA_FATTN_VEC_MAX_NQ");
+                return e != nullptr ? std::max(0, atoi(e)) : 2;
+            }();
+            if (Q->ne[1] <= vec_max_nq) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
