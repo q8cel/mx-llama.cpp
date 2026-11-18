@@ -337,8 +337,13 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
             case GGML_TYPE_Q6_K: {
-                const dim3 grid((ne01 + 4 - 1) / 4, 1, 1);
-                mul_mat_vec_rp<GGML_TYPE_Q6_K, 4, 4, false><<<grid, 256, 0, stream>>>(
+                // 32 lanes per row: 5120 and 3072-column rows are exact multiples,
+                // so no lane idles in the last sub-block round, and the 2-deep
+                // prefetch keeps two fetches in flight per lane, and the
+                // activation row is staged once per block in LDS.
+                const dim3 grid((ne01 + 8 - 1) / 8, 1, 1);
+                const size_t x_lds = (size_t) (ne00 >> 5) * sizeof(block_q8_1);
+                mul_mat_vec_rp<GGML_TYPE_Q6_K, 8, 4, false, 32, false, 2, true><<<grid, 256, x_lds, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
@@ -438,6 +443,58 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     GGML_UNUSED(ctx);
 }
 
+// Grouped single-token mat-vec: several repacked Q6_K matrices that share the
+// same activation row go out as one kernel launch.
+bool ggml_cuda_mul_mat_vec_repacked_group(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        int n, const ggml_tensor * const * src0s, ggml_tensor * const * dsts) {
+    if (n < 2 || n > RP_MMV_GROUP_MAX) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) ||
+        src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const int64_t ne00 = src0s[0]->ne[0];
+    for (int m = 0; m < n; m++) {
+        const ggml_tensor * s0 = src0s[m];
+        const ggml_tensor * d  = dsts[m];
+        if (s0->type != GGML_TYPE_Q6_K || s0->ne[0] != ne00 || d->type != GGML_TYPE_F32 ||
+            d->ne[0] != s0->ne[1] || d->ne[1] != 1 || d->nb[0] != sizeof(float)) {
+            return false;
+        }
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    rp_mmv_group g = {};
+    g.nmat = n;
+    uint32_t nblk = 0;
+    for (int m = 0; m < n; m++) {
+        const ggml_tensor * s0 = src0s[m];
+        if (s0->view_src != nullptr && ggml_cuda_repack_tensor_supported(s0->view_src)) {
+            g.w[m] = repack_view_get_cached(s0, s0->view_src, stream);
+        } else {
+            g.w[m] = (const uint8_t *) s0->data;
+        }
+        g.y[m]    = (float *) dsts[m]->data;
+        g.rows[m] = (uint32_t) s0->ne[1];
+        g.boff[m] = nblk;
+        nblk += (g.rows[m] + RP_MMV_GROUP_ROWS - 1) / RP_MMV_GROUP_ROWS;
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const int64_t x_stride    = ne10_padded / QK8_1;
+    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+    const block_q8_1 * xq = repack_quantize_src1_q8_1(ctx, src0s[0], src1, ne00, ne10_padded,
+        src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+        1, 1, 1, (size_t) x_stride, src1_q8_1_own, stream);
+
+    const size_t x_lds = (size_t) (ne00 >> 5) * sizeof(block_q8_1);
+    mul_mat_vec_rp_group<GGML_TYPE_Q6_K><<<dim3(nblk, 1, 1), RP_MMV_GROUP_TPB, x_lds, stream>>>(
+        g, xq, (uint32_t) ne00);
+    return true;
+}
+
 // Fused MMV entry for repacked weights (dense): single-token only, fuses the up and
 // gate dot products (shared quantized input) plus optional biases and the GLU op.
 // Dispatch: ggml_cuda_try_fuse `{op,op,GLU}` and `{op,ADD}` repack branches.
@@ -525,7 +582,8 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);
         } else if (src0->type == GGML_TYPE_Q6_K) {
-            mul_mat_vec_rp<GGML_TYPE_Q6_K, 4, 4, false, 64, true><<<dim3((ne01 + 3) / 4, 1, 1), 256, 0, stream>>>(
+            mul_mat_vec_rp<GGML_TYPE_Q6_K, 8, 4, false, 32, true, 2, true><<<dim3((ne01 + 7) / 8, 1, 1), 256,
+                (size_t) (ne00 >> 5) * sizeof(block_q8_1), stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);

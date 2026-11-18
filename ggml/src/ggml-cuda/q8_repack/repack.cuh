@@ -104,6 +104,20 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 // below can serve. Wider batches fall through to the tiled GEMM.
 bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids, ggml_type wt);
 
+// Grouped single-token mat-vec geometry (see mul_mat_vec_rp_group in
+// repack-kernels.cuh): up to RP_MMV_GROUP_MAX matrices, one block per
+// RP_MMV_GROUP_ROWS output rows, RP_MMV_GROUP_LANES lanes per row.
+constexpr int RP_MMV_GROUP_MAX   = 6;
+constexpr int RP_MMV_GROUP_ROWS  = 8;
+constexpr int RP_MMV_GROUP_LANES = 32;
+constexpr int RP_MMV_GROUP_TPB   = RP_MMV_GROUP_ROWS * RP_MMV_GROUP_LANES;
+
+// Single-token mat-vec over several repacked weight matrices that share one
+// activation row (see mul_mat_vec_rp_group). Returns false when the group does
+// not qualify, in which case the caller launches the nodes one by one.
+bool ggml_cuda_mul_mat_vec_repacked_group(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        int n, const ggml_tensor * const * src0s, ggml_tensor * const * dsts);
+
 void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion);

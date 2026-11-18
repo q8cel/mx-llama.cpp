@@ -397,7 +397,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 // machinery. Q8_0 keeps its tuned bespoke kernel; every other type gets this
 // one for free, including the fused up/gate variant.
 template <ggml_type WT, int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64,
-          bool HAS_FUSION = false>
+          bool HAS_FUSION = false, int UNROLL = 1, bool X_LDS = false>
 static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -437,6 +437,19 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
     const uint32_t n_sub = ne0 >> 5;
     const typename rp_traits<WT>::geom wg(ne0, ne1);
 
+    // The activation row is the same for every output row this block computes,
+    // so one copy per block in LDS keeps ROWS waves of L1 reads off it.
+    extern __shared__ uint32_t rp_sx_raw[];
+    const block_q8_1 * xq_lds = xq;
+    if constexpr (X_LDS) {
+        block_q8_1 * sx = reinterpret_cast<block_q8_1 *>(rp_sx_raw);
+        for (uint32_t i = threadIdx.x; i < n_sub; i += NWAVES * 64) {
+            sx[i] = xq[i];
+        }
+        __syncthreads();
+        xq_lds = sx;
+    }
+
     const int warp_id = threadIdx.x / LANES;
     const int lane    = threadIdx.x % LANES;
     const int row     = blockIdx.x * ROWS + warp_id;
@@ -446,11 +459,22 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 
     float acc = 0.0f;
     [[maybe_unused]] float acc_gate = 0.0f;
-    for (uint32_t sb = (uint32_t) lane; sb < n_sub; sb += LANES) {
-        uint4 lo, hi;
-        typename rp_traits<WT>::slot_t ds;
-        rp_traits<WT>::load_w(wbase, wg, wrow, sb, lo, hi, ds);
-        const block_q8_1 * xb = xq + sb;
+
+    // One sub-block: the dot products only, weight fetches come from the caller
+    // so UNROLL of them can be in flight at once.
+    auto consume = [&](const uint32_t sb, const uint4 & lo, const uint4 & hi,
+                       const typename rp_traits<WT>::slot_t & ds,
+                       const uint4 & glo, const uint4 & ghi,
+                       const typename rp_traits<WT>::slot_t & gds) {
+        GGML_UNUSED(lo);
+        GGML_UNUSED(hi);
+        GGML_UNUSED(ds);
+        if constexpr (!HAS_FUSION) {
+            GGML_UNUSED(glo);
+            GGML_UNUSED(ghi);
+            GGML_UNUSED(gds);
+        }
+        const block_q8_1 * xb = xq_lds + sb;
         const float dx = __low2float(xb->ds);
         const int * x32 = reinterpret_cast<const int *>(xb->qs);
         if constexpr (rp_traits<WT>::split_scales) {
@@ -471,9 +495,6 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
         }
         if constexpr (HAS_FUSION) {
             if (use_gate) {
-                uint4 glo, ghi;
-                typename rp_traits<WT>::slot_t gds;
-                rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, glo, ghi, gds);
                 if constexpr (rp_traits<WT>::split_scales) {
                     const int glo_d = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
                     const int ghi_d = mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
@@ -491,6 +512,45 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
                 }
             }
         }
+    };
+
+    uint32_t sb = (uint32_t) lane;
+    if constexpr (UNROLL > 1) {
+        // Prefetch UNROLL sub-blocks, then consume them: the fetches of the whole
+        // group are in flight while the first dot product runs, which is what the
+        // single-deep loop cannot do without one register set per fetch.
+        for (; sb + (UNROLL - 1) * LANES < n_sub; sb += UNROLL * LANES) {
+            uint4 lo[UNROLL], hi[UNROLL];
+            uint4 glo[UNROLL], ghi[UNROLL];
+            typename rp_traits<WT>::slot_t ds[UNROLL];
+            typename rp_traits<WT>::slot_t gds[UNROLL];
+#pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                rp_traits<WT>::load_w(wbase, wg, wrow, sb + u * LANES, lo[u], hi[u], ds[u]);
+                if constexpr (HAS_FUSION) {
+                    if (use_gate) {
+                        rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb + u * LANES, glo[u], ghi[u], gds[u]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < UNROLL; u++) {
+                consume(sb + u * LANES, lo[u], hi[u], ds[u], glo[u], ghi[u], gds[u]);
+            }
+        }
+    }
+    for (; sb < n_sub; sb += LANES) {
+        uint4 lo, hi;
+        typename rp_traits<WT>::slot_t ds;
+        uint4 glo, ghi;
+        typename rp_traits<WT>::slot_t gds;
+        rp_traits<WT>::load_w(wbase, wg, wrow, sb, lo, hi, ds);
+        if constexpr (HAS_FUSION) {
+            if (use_gate) {
+                rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, glo, ghi, gds);
+            }
+        }
+        consume(sb, lo, hi, ds, glo, ghi, gds);
     }
     const float a = rp_warp_reduce_sum<LANES>(acc);
     [[maybe_unused]] float g = 0.0f;
@@ -512,6 +572,95 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, nchannels_y, expert_stride,
                      xs_id, dst_s1, wbase_gate, x_bias, gate_bias, glu_op);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Several single-token mat-vecs that share one activation row, in one launch.
+//
+// Column-parallel projections of a layer (qkv, gate, alpha, beta, ...) all read
+// the same normalized activation, so each of them pays the launch filling cost
+// on its own while moving very few bytes. Here the blocks of all the matrices
+// form one grid: `boff` maps a block to its matrix, so a block still computes a
+// single matrix and the register pressure stays that of the plain mat-vec (no
+// per-lane dual accumulator, which is what costs the up/gate fusion its gain).
+
+struct rp_mmv_group {
+    const uint8_t * w[RP_MMV_GROUP_MAX];
+    float *         y[RP_MMV_GROUP_MAX];
+    uint32_t        rows[RP_MMV_GROUP_MAX];
+    uint32_t        boff[RP_MMV_GROUP_MAX];
+    int             nmat;
+};
+
+template <ggml_type WT>
+static __global__ void __launch_bounds__(RP_MMV_GROUP_TPB) mul_mat_vec_rp_group(
+        const rp_mmv_group g, const block_q8_1 * __restrict__ xq, const uint32_t ne0) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static_assert(rp_traits<WT>::split_scales, "grouped mat-vec: split-scale types only");
+    const uint32_t n_sub = ne0 >> 5;
+
+    extern __shared__ uint32_t sx_raw[];
+    block_q8_1 * sx = reinterpret_cast<block_q8_1 *>(sx_raw);
+    for (uint32_t i = threadIdx.x; i < n_sub; i += RP_MMV_GROUP_TPB) {
+        sx[i] = xq[i];
+    }
+    __syncthreads();
+
+    int m = 0;
+#pragma unroll
+    for (int j = RP_MMV_GROUP_MAX - 1; j >= 0; --j) {
+        if (j < g.nmat && blockIdx.x >= g.boff[j]) {
+            m = j;
+            break;
+        }
+    }
+    const int      lg  = threadIdx.x / RP_MMV_GROUP_LANES;
+    const int      lane = threadIdx.x % RP_MMV_GROUP_LANES;
+    const uint32_t row = (blockIdx.x - g.boff[m]) * RP_MMV_GROUP_ROWS + lg;
+    if (row >= g.rows[m]) {
+        return;
+    }
+
+    const typename rp_traits<WT>::geom wg(ne0, g.rows[m]);
+    const uint8_t * wbase = g.w[m];
+
+    float    acc = 0.0f;
+    auto consume = [&](const uint32_t sb, const uint4 & lo, const uint4 & hi,
+                       const typename rp_traits<WT>::slot_t & ds) {
+        const block_q8_1 * xb = sx + sb;
+        const float dx = __low2float(xb->ds);
+        const int * x32 = reinterpret_cast<const int *>(xb->qs);
+        const int ilo = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
+        const int ihi = mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
+        const float2 dd = rp_traits<WT>::scale2(ds);
+        acc += dd.x * dx * (float) ilo + dd.y * dx * (float) ihi;
+    };
+
+    uint32_t sb = (uint32_t) lane;
+    for (; sb + RP_MMV_GROUP_LANES < n_sub; sb += 2 * RP_MMV_GROUP_LANES) {
+        uint4 lo0, hi0, lo1, hi1;
+        typename rp_traits<WT>::slot_t ds0, ds1;
+        rp_traits<WT>::load_w(wbase, wg, row, sb, lo0, hi0, ds0);
+        rp_traits<WT>::load_w(wbase, wg, row, sb + RP_MMV_GROUP_LANES, lo1, hi1, ds1);
+        consume(sb, lo0, hi0, ds0);
+        consume(sb + RP_MMV_GROUP_LANES, lo1, hi1, ds1);
+    }
+    for (; sb < n_sub; sb += RP_MMV_GROUP_LANES) {
+        uint4 lo, hi;
+        typename rp_traits<WT>::slot_t ds;
+        rp_traits<WT>::load_w(wbase, wg, row, sb, lo, hi, ds);
+        consume(sb, lo, hi, ds);
+    }
+
+    const float a = rp_warp_reduce_sum<RP_MMV_GROUP_LANES>(acc);
+    if (lane == 0) {
+        g.y[m][row] = a;
+    }
+#else
+    GGML_UNUSED(g);
+    GGML_UNUSED(xq);
+    GGML_UNUSED(ne0);
     NO_DEVICE_CODE;
 #endif
 }

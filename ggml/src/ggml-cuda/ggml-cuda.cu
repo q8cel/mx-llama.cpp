@@ -34,6 +34,8 @@
 #include "ggml-cuda/q8_repack/repack.cuh"
 
 #include <atomic>
+#include <unordered_map>
+#include <unordered_set>
 
 // Opt-in per-type per-width histogram of fused MoE up/gate mat-vec launches, host side only, no synchronization.
 // GGML_CUDA_REPACK_MOE_FUSION_STATS=1 prints the non-zero cells every 8192 launches and at process exit.
@@ -4526,6 +4528,94 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// Grouped single-token mat-vec: column-parallel projections of a layer (qkv,
+// gate, alpha, beta, ...) all read the same activation row and each pays the
+// launch filling cost alone. They are executed by one kernel (mul_mat_vec_rp_group
+// in repack-kernels.cuh) launched at the first one's position; the others are
+// skipped when the loop reaches them. Writing a later node's output early is
+// only done when no node in between reads or writes that buffer range, which is
+// what keeps a recycled buffer from being clobbered.
+static const bool g_mmv_group_on = [] {
+    const char * e = getenv("GGML_CUDA_MMV_GROUP");
+    return e == nullptr || e[0] == '\0' || e[0] != '0';
+}();
+
+// Outputs already written by a grouped launch, per graph evaluation, plus the
+// number of groupable mat-vecs per activation row so a node with no sibling
+// never scans the graph.
+static thread_local std::unordered_set<const ggml_tensor *> g_mmv_done;
+static thread_local std::unordered_map<const ggml_tensor *, int> g_mmv_src1_count;
+
+static bool ggml_cuda_mmv_group_candidate(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr && node->src[2] == nullptr &&
+           node->ne[1] == 1 && node->src[0]->type == GGML_TYPE_Q6_K &&
+           ggml_cuda_repack_mul_mat_should_fire(node->src[0]);
+}
+
+static bool ggml_cuda_range_overlap(const void * a, size_t na, const void * b, size_t nb) {
+    const uintptr_t a0 = (uintptr_t) a, a1 = a0 + na;
+    const uintptr_t b0 = (uintptr_t) b, b1 = b0 + nb;
+    return a0 < b1 && b0 < a1;
+}
+
+static bool ggml_cuda_launch_mmv_group(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i,
+                                       std::unordered_set<const ggml_tensor *> & done) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (!ggml_cuda_mmv_group_candidate(mm)) {
+        return false;
+    }
+    const ggml_tensor * s1 = mm->src[1];
+
+    const ggml_tensor * src0s[RP_MMV_GROUP_MAX];
+    ggml_tensor *       dsts [RP_MMV_GROUP_MAX];
+    int n = 0;
+    src0s[n] = mm->src[0];
+    dsts [n] = const_cast<ggml_tensor *>(mm);
+    n++;
+
+    for (int j = i + 1; j < cgraph->n_nodes && n < RP_MMV_GROUP_MAX; j++) {
+        const ggml_tensor * o = cgraph->nodes[j];
+        if (o->src[1] != s1 || !ggml_cuda_mmv_group_candidate(o) ||
+            o->src[0]->ne[0] != mm->src[0]->ne[0]) {
+            continue;
+        }
+        if (o->data == nullptr || done.count(o)) {
+            continue;
+        }
+        bool clash = false;
+        for (int k = i; k < j && !clash; k++) {
+            const ggml_tensor * t = cgraph->nodes[k];
+            if (t->data == nullptr || t == o) {
+                continue;
+            }
+            clash = ggml_cuda_range_overlap(t->data, ggml_nbytes(t), o->data, ggml_nbytes(o));
+            for (int s = 0; s < GGML_MAX_SRC && !clash; s++) {
+                const ggml_tensor * ts = t->src[s];
+                if (ts != nullptr && ts->data != nullptr && ts != o) {
+                    clash = ggml_cuda_range_overlap(ts->data, ggml_nbytes(ts), o->data, ggml_nbytes(o));
+                }
+            }
+        }
+        if (clash) {
+            continue;
+        }
+        src0s[n] = o->src[0];
+        dsts [n] = const_cast<ggml_tensor *>(o);
+        n++;
+    }
+
+    if (n < 2) {
+        return false;
+    }
+    if (!ggml_cuda_mul_mat_vec_repacked_group(*cuda_ctx, s1, n, src0s, dsts)) {
+        return false;
+    }
+    for (int m = 0; m < n; m++) {
+        done.insert(dsts[m]);
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -5695,6 +5785,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
+    g_mmv_done.clear();
+    if (g_mmv_group_on) {
+        g_mmv_src1_count.clear();
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (ggml_cuda_mmv_group_candidate(n)) {
+                g_mmv_src1_count[n->src[1]]++;
+            }
+        }
+    }
+
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
@@ -5832,7 +5933,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (g_mmv_group_on && g_mmv_done.count(node)) {
+                    // already computed by the grouped launch of an earlier node
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (nodes_to_skip == 0 && g_mmv_group_on && !should_launch_concurrent_events &&
+                    ggml_cuda_mmv_group_candidate(node)) {
+                    const auto it = g_mmv_src1_count.find(node->src[1]);
+                    if (it != g_mmv_src1_count.end() && it->second > 1 &&
+                        ggml_cuda_launch_mmv_group(cuda_ctx, cgraph, i, g_mmv_done)) {
+                        continue;
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
